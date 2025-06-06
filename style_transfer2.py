@@ -7,18 +7,21 @@ import torchvision.transforms as transforms
 from PIL import Image, ImageOps
 import matplotlib.pyplot as plt
 
+from utils import CONTENT_IMAGE, OUTPUT_IMAGE, STYLE_FOLDER, get_device
+
 # ------------------------------
 # Utility Functions
 # ------------------------------
 
+
 def load_image(image_path, max_size=256, device=torch.device("cpu")):
     """
-    Load an image, apply EXIF orientation, resize while preserving aspect ratio, 
+    Load an image, apply EXIF orientation, resize while preserving aspect ratio,
     and preprocess it for VGG19.
     """
-    image = Image.open(image_path).convert('RGB')
+    image = Image.open(image_path).convert("RGB")
     image = ImageOps.exif_transpose(image)
-    
+
     width, height = image.size
     if max(width, height) > max_size:
         if width > height:
@@ -28,14 +31,16 @@ def load_image(image_path, max_size=256, device=torch.device("cpu")):
             new_height = max_size
             new_width = int(width * max_size / height)
         image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
+
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
     image = transform(image).unsqueeze(0)
     return image.to(device)
+
 
 def save_image(tensor, path):
     """
@@ -49,6 +54,7 @@ def save_image(tensor, path):
     image = transforms.ToPILImage()(image)
     image.save(path)
 
+
 def gram_matrix(feature_map):
     """
     Compute the Gram matrix for a feature map.
@@ -58,17 +64,24 @@ def gram_matrix(feature_map):
     gram = torch.mm(features, features.t())
     return gram.div(b * c * h * w)
 
+
 # ------------------------------
 # Classes
 # ------------------------------
+
 
 class VGGFeatures(nn.Module):
     """
     Extract features from specified VGG19 layers.
     """
+
     def __init__(self, layers, device=torch.device("cpu")):
         super(VGGFeatures, self).__init__()
-        vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features.to(device).eval()
+        vgg = (
+            models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1)
+            .features.to(device)
+            .eval()
+        )
         self.layers = layers
         self.model = nn.Sequential()
         max_layer = max(int(layer) for layer in layers)
@@ -88,10 +101,12 @@ class VGGFeatures(nn.Module):
                 outputs[name] = x
         return outputs
 
+
 class ContentLoss(nn.Module):
     """
     Compute content loss between input and target features.
     """
+
     def __init__(self, target):
         super(ContentLoss, self).__init__()
         self.target = target.detach()
@@ -99,10 +114,12 @@ class ContentLoss(nn.Module):
     def forward(self, input):
         return nn.functional.mse_loss(input, self.target)
 
+
 class StyleLoss(nn.Module):
     """
     Compute style loss between input Gram matrix and target Gram matrix.
     """
+
     def __init__(self, target_gram):
         super(StyleLoss, self).__init__()
         self.target = target_gram.detach()
@@ -111,9 +128,11 @@ class StyleLoss(nn.Module):
         gram = gram_matrix(input)
         return nn.functional.mse_loss(gram, self.target)
 
+
 # ------------------------------
 # Main Execution Logic
 # ------------------------------
+
 
 def main():
     # Hyperparameters
@@ -121,27 +140,26 @@ def main():
     style_weight = 18e6  # Reduced style weight to prevent large gradients
     num_steps = 40000
     content_max_size = 512  # Increased for higher-resolution content
-    style_max_size = 128     # Increased for higher-resolution style
-    content_layers = ['21'] # conv4_2 in VGG19
-    style_layers = ['1', '6', '11', '20', '29']  # Style layers
+    style_max_size = 128  # Increased for higher-resolution style
+    content_layers = ["21"]  # conv4_2 in VGG19
+    style_layers = ["1", "6", "11", "20", "29"]  # Style layers
 
     # Early stopping parameters
     early_stop_patience = 100  # Number of steps to wait for significant improvement
     improvement_threshold = 1e-4  # Relative improvement threshold (0.01%)
-    best_loss = float('inf')
+    best_loss = float("inf")
     patience_counter = 0
 
-    # Paths (update these to your local paths)
-    content_path = r"C:\Users\jimen\OneDrive\Desktop\neuralnetworks\cat2.jpeg"
-    style_folder = r"C:\Users\jimen\OneDrive\Desktop\neuralnetworks\picasso"
-    output_path = r"C:\Users\jimen\OneDrive\Desktop\neuralnetworks\dog_picasso_style.jpg"
+    # Paths configured via environment variables
+    content_path = CONTENT_IMAGE
+    style_folder = STYLE_FOLDER
+    output_path = OUTPUT_IMAGE
 
     # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not torch.cuda.is_available():
+    device = get_device()
+    if device.type != "cuda":
         print("CUDA is not available. Exiting.")
         return
-    print(f"Using device: {device}")
 
     # Load content image
     content_img = load_image(content_path, max_size=content_max_size, device=device)
@@ -155,8 +173,11 @@ def main():
         content_features = vgg(content_img)
 
     # Load style image paths
-    style_paths = [os.path.join(style_folder, f) for f in os.listdir(style_folder)
-                   if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
+    style_paths = [
+        os.path.join(style_folder, f)
+        for f in os.listdir(style_folder)
+        if f.lower().endswith((".jpg", ".png", ".jpeg"))
+    ]
     print(f"Found {len(style_paths)} style images.")
 
     # Accumulate Gram matrices for style images in batches
@@ -165,7 +186,7 @@ def main():
     batch_size = 50
     print(f"Processing {num_styles} style images in batches of {batch_size}...")
     for i in range(0, num_styles, batch_size):
-        batch_paths = style_paths[i:i + batch_size]
+        batch_paths = style_paths[i : i + batch_size]
         for path in batch_paths:
             style_img = load_image(path, max_size=style_max_size, device=device)
             with torch.no_grad():
@@ -178,7 +199,9 @@ def main():
                         accum_grams[layer] += gram
             del style_img, features
             torch.cuda.empty_cache()
-        print(f"Processed batch {i // batch_size + 1}/{(num_styles + batch_size - 1) // batch_size}")
+        print(
+            f"Processed batch {i // batch_size + 1}/{(num_styles + batch_size - 1) // batch_size}"
+        )
 
     # Average the Gram matrices
     style_grams = {layer: accum_grams[layer] / num_styles for layer in style_layers}
@@ -197,11 +220,13 @@ def main():
     print("Starting style transfer optimization...")
     for step in range(num_steps):
         optimizer.zero_grad()
-        
+
         # Forward pass in full precision
         features = vgg(target_img)
         c_loss = content_loss(features[content_layers[0]])
-        s_loss = sum(style_losses[layer](features[layer]) for layer in style_layers) / len(style_layers)
+        s_loss = sum(
+            style_losses[layer](features[layer]) for layer in style_layers
+        ) / len(style_layers)
         total_loss = content_weight * c_loss + style_weight * s_loss
 
         total_loss.backward()
@@ -217,20 +242,27 @@ def main():
 
         # Early stopping logic: Check for relative improvement
         current_loss = total_loss.item()
-        if best_loss > 0 and (best_loss - current_loss) / best_loss < improvement_threshold:
+        if (
+            best_loss > 0
+            and (best_loss - current_loss) / best_loss < improvement_threshold
+        ):
             patience_counter += 1
         else:
             best_loss = current_loss
             patience_counter = 0
 
         if step % 10 == 0:
-            print(f"Step {step}/{num_steps}, Loss: {current_loss:.4f}, Patience: {patience_counter}/{early_stop_patience}")
+            print(
+                f"Step {step}/{num_steps}, Loss: {current_loss:.4f}, Patience: {patience_counter}/{early_stop_patience}"
+            )
             if torch.isnan(total_loss):
                 print("NaN detected in loss. Stopping optimization.")
                 break
 
         if patience_counter >= early_stop_patience:
-            print(f"Early stopping triggered at step {step} with loss {current_loss:.4f}")
+            print(
+                f"Early stopping triggered at step {step} with loss {current_loss:.4f}"
+            )
             break
 
         torch.cuda.empty_cache()
@@ -240,8 +272,9 @@ def main():
     print(f"Stylized image saved as {output_path}")
 
     plt.imshow(Image.open(output_path))
-    plt.axis('off')
+    plt.axis("off")
     plt.show()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

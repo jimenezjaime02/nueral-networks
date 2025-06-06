@@ -8,6 +8,8 @@ from PIL import Image
 import os
 from tqdm import tqdm  # For the progress bar
 
+from utils import PET_DATA_DIR, get_device
+
 
 # ======================
 # Configuration
@@ -16,7 +18,8 @@ class Config:
     # Data parameters
     IMG_SIZE = 32
     CHANNELS = 3
-    DATA_PATH = r"C:\Users\jimen\OneDrive\Desktop\neuralnetworks\kagglecatsanddogs_3367a\PetImages"  # <-- Adjust if needed
+    # Dataset directory configurable via the ``PET_DATA_DIR`` environment variable.
+    DATA_PATH = PET_DATA_DIR
     BATCH_SIZE = 64
     NUM_WORKERS = 8
 
@@ -38,17 +41,6 @@ class Config:
 
 
 # ======================
-# Device Setup
-# ======================
-def get_device():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device}")
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-    return device
-
-
-# ======================
 # Diffusion Utilities
 # ======================
 def get_timestep_embedding(timesteps, embedding_dim):
@@ -61,7 +53,7 @@ def get_timestep_embedding(timesteps, embedding_dim):
     emb = timesteps.float() * emb.unsqueeze(0)
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
     if embedding_dim % 2 == 1:
-        emb = torch.nn.functional.pad(emb, (0,1))
+        emb = torch.nn.functional.pad(emb, (0, 1))
     return emb
 
 
@@ -75,7 +67,13 @@ def compute_diffusion_params(config, device):
     alphas_cumprod = torch.cumprod(alphas, dim=0)
     sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
     sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
-    return betas, alphas, alphas_cumprod, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod
+    return (
+        betas,
+        alphas,
+        alphas_cumprod,
+        sqrt_alphas_cumprod,
+        sqrt_one_minus_alphas_cumprod,
+    )
 
 
 def forward_diffusion(x0, t, noise, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod):
@@ -95,20 +93,23 @@ class SelfAttention(nn.Module):
     """
     A multi-head self-attention module for 2D feature maps.
     """
+
     def __init__(self, in_channels, num_heads=4):
         super().__init__()
         self.in_channels = in_channels
         self.num_heads = num_heads
-        
+
         # Each head gets head_dim = in_channels // num_heads
-        assert in_channels % num_heads == 0, "in_channels must be divisible by num_heads"
+        assert (
+            in_channels % num_heads == 0
+        ), "in_channels must be divisible by num_heads"
         self.head_dim = in_channels // num_heads
-        
+
         # Convolutional projections for Q, K, V (1x1 conv = linear layer in 2D)
         self.query = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-        self.key   = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.key = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-        
+
         # Output projection after combining attention heads
         self.out_proj = nn.Conv2d(in_channels, in_channels, kernel_size=1)
 
@@ -117,7 +118,7 @@ class SelfAttention(nn.Module):
         x: (B, C, H, W)
         """
         B, C, H, W = x.shape
-        
+
         # 1) Project Q, K, V
         q = self.query(x)  # (B, C, H, W)
         k = self.key(x)
@@ -133,7 +134,7 @@ class SelfAttention(nn.Module):
         k = k.permute(0, 1, 2, 3)  # (B, num_heads, head_dim, H*W)
 
         # 4) Compute attention scores
-        attn_scores = torch.matmul(q, k) / (self.head_dim ** 0.5)
+        attn_scores = torch.matmul(q, k) / (self.head_dim**0.5)
         attn_prob = torch.softmax(attn_scores, dim=-1)  # (B, num_heads, H*W, H*W)
 
         # 5) Apply attention to values
@@ -166,7 +167,7 @@ class ResidualBlock(nn.Module):
             self.res_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
             self.res_conv = nn.Identity()
-    
+
     def forward(self, x, t_emb):
         """
         x: (B, in_channels, H, W)
@@ -190,6 +191,7 @@ class ImprovedUNet(nn.Module):
     """
     UNet with Residual Blocks, Time Embedding, and an Attention Block in the bottleneck.
     """
+
     def __init__(self, time_emb_dim=128, channels=3, base_channels=128):
         super().__init__()
         self.time_emb_dim = time_emb_dim
@@ -198,24 +200,30 @@ class ImprovedUNet(nn.Module):
         self.time_mlp = nn.Sequential(
             nn.Linear(time_emb_dim, time_emb_dim),
             nn.ReLU(),
-            nn.Linear(time_emb_dim, time_emb_dim)
+            nn.Linear(time_emb_dim, time_emb_dim),
         )
 
         # Downsampling path
         self.down1 = ResidualBlock(channels, base_channels, time_emb_dim)
-        self.down2 = ResidualBlock(base_channels, base_channels*2, time_emb_dim)
+        self.down2 = ResidualBlock(base_channels, base_channels * 2, time_emb_dim)
         self.pool = nn.MaxPool2d(2)
 
         # Bottleneck: Residual block + Self-Attention
-        self.bottleneck = ResidualBlock(base_channels*2, base_channels*4, time_emb_dim)
-        self.self_attn = SelfAttention(base_channels*4, num_heads=4)
+        self.bottleneck = ResidualBlock(
+            base_channels * 2, base_channels * 4, time_emb_dim
+        )
+        self.self_attn = SelfAttention(base_channels * 4, num_heads=4)
 
         # Upsampling path
-        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.up1 = ResidualBlock(base_channels*4 + base_channels*2, base_channels*2, time_emb_dim)
-        self.up2 = ResidualBlock(base_channels*2 + base_channels, base_channels, time_emb_dim)
+        self.upsample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.up1 = ResidualBlock(
+            base_channels * 4 + base_channels * 2, base_channels * 2, time_emb_dim
+        )
+        self.up2 = ResidualBlock(
+            base_channels * 2 + base_channels, base_channels, time_emb_dim
+        )
         self.conv_final = nn.Conv2d(base_channels, channels, kernel_size=1)
-    
+
     def forward(self, x, t):
         # 1) Time Embedding
         t = t.unsqueeze(-1)  # shape: (B, 1)
@@ -223,23 +231,23 @@ class ImprovedUNet(nn.Module):
         t_emb = self.time_mlp(t_emb)
 
         # 2) Downsample
-        d1 = self.down1(x, t_emb)                # (B, base_channels,    H,   W)
-        d2 = self.down2(self.pool(d1), t_emb)    # (B, base_channels*2,  H/2, W/2)
+        d1 = self.down1(x, t_emb)  # (B, base_channels,    H,   W)
+        d2 = self.down2(self.pool(d1), t_emb)  # (B, base_channels*2,  H/2, W/2)
 
         # 3) Bottleneck
         b = self.bottleneck(self.pool(d2), t_emb)  # (B, base_channels*4, H/4, W/4)
-        b = self.self_attn(b)                     # Apply self-attention
+        b = self.self_attn(b)  # Apply self-attention
 
         # 4) Upsample
-        up1 = self.upsample(b)                    # (B, base_channels*4, H/2, W/2)
-        up1 = torch.cat([up1, d2], dim=1)         # Skip connection
-        up1 = self.up1(up1, t_emb)                # (B, base_channels*2, H/2, W/2)
+        up1 = self.upsample(b)  # (B, base_channels*4, H/2, W/2)
+        up1 = torch.cat([up1, d2], dim=1)  # Skip connection
+        up1 = self.up1(up1, t_emb)  # (B, base_channels*2, H/2, W/2)
 
-        up2 = self.upsample(up1)                  # (B, base_channels*2, H,   W)
-        up2 = torch.cat([up2, d1], dim=1)         # Skip connection
-        up2 = self.up2(up2, t_emb)                # (B, base_channels,   H,   W)
+        up2 = self.upsample(up1)  # (B, base_channels*2, H,   W)
+        up2 = torch.cat([up2, d1], dim=1)  # Skip connection
+        up2 = self.up2(up2, t_emb)  # (B, base_channels,   H,   W)
 
-        out = self.conv_final(up2)                # (B, channels, H, W)
+        out = self.conv_final(up2)  # (B, channels, H, W)
         return out
 
 
@@ -251,25 +259,29 @@ def safe_loader(path):
     Safely load an image from disk. If there's an error, return None.
     """
     try:
-        with open(path, 'rb') as f:
+        with open(path, "rb") as f:
             img = Image.open(f)
-            return img.convert('RGB')
+            return img.convert("RGB")
     except Exception:
         return None
 
 
 def get_transforms(img_size):
-    return transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
+    return transforms.Compose(
+        [
+            transforms.Resize((img_size, img_size)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]
+    )
 
 
 def load_dataset(data_path, transform):
     print(f"[INFO] Loading dataset from: {data_path}")
-    dataset = torchvision.datasets.ImageFolder(root=data_path, transform=transform, loader=safe_loader)
+    dataset = torchvision.datasets.ImageFolder(
+        root=data_path, transform=transform, loader=safe_loader
+    )
     print(f"[INFO] Found classes: {dataset.classes}")
     print(f"[INFO] Total images in dataset: {len(dataset)}")
     return dataset
@@ -279,9 +291,9 @@ def filter_dog_dataset(dataset):
     """
     Keep only 'Dog' images from the dataset.
     """
-    if 'Dog' not in dataset.class_to_idx:
+    if "Dog" not in dataset.class_to_idx:
         raise ValueError("[ERROR] 'Dog' class not found in dataset.")
-    dog_class_index = dataset.class_to_idx['Dog']
+    dog_class_index = dataset.class_to_idx["Dog"]
     dog_indices = []
     for i, (img, label) in enumerate(dataset):
         if img is not None and label == dog_class_index:
@@ -292,17 +304,29 @@ def filter_dog_dataset(dataset):
 
 
 def create_dataloader(dataset, batch_size, num_workers=4):
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True, 
-                      num_workers=num_workers, pin_memory=True)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
 
 
 # ======================
 # Training and Sampling
 # ======================
-def train_model(model, train_loader, optimizer, config, device, 
-                sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod):
+def train_model(
+    model,
+    train_loader,
+    optimizer,
+    config,
+    device,
+    sqrt_alphas_cumprod,
+    sqrt_one_minus_alphas_cumprod,
+):
     """
-    Main training loop for the diffusion model. 
+    Main training loop for the diffusion model.
     Each iteration:
       - Sample a random timestep t
       - Add noise to the real image according to q(x_t | x_0)
@@ -311,15 +335,17 @@ def train_model(model, train_loader, optimizer, config, device,
     """
     model.train()
     criterion = nn.MSELoss()
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     print("[INFO] Starting training...")
 
     for epoch in range(config.EPOCHS):
-        progress_bar = tqdm(enumerate(train_loader),
-                            total=len(train_loader),
-                            desc=f"Epoch {epoch+1}/{config.EPOCHS}",
-                            leave=True)
+        progress_bar = tqdm(
+            enumerate(train_loader),
+            total=len(train_loader),
+            desc=f"Epoch {epoch+1}/{config.EPOCHS}",
+            leave=True,
+        )
 
         for batch_idx, (x0, _) in progress_bar:
             if x0 is None:
@@ -333,12 +359,14 @@ def train_model(model, train_loader, optimizer, config, device,
             noise = torch.randn_like(x0)
 
             # Forward diffusion to get x_t
-            xt = forward_diffusion(x0, t, noise, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod)
-            
-            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+            xt = forward_diffusion(
+                x0, t, noise, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod
+            )
+
+            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 predicted_noise = model(xt, t)
                 loss = criterion(predicted_noise, noise)
-            
+
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -356,22 +384,30 @@ def sample(model, config, device, betas, alphas, alphas_cumprod):
     model.eval()
     print("[INFO] Starting sampling...")
     with torch.no_grad():
-        with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
-            x = torch.randn(config.N_SAMPLES, config.CHANNELS, config.IMG_SIZE, config.IMG_SIZE, device=device)
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            x = torch.randn(
+                config.N_SAMPLES,
+                config.CHANNELS,
+                config.IMG_SIZE,
+                config.IMG_SIZE,
+                device=device,
+            )
             x = x.contiguous(memory_format=torch.channels_last)
 
             for t in reversed(range(config.T)):
-                t_tensor = torch.full((config.N_SAMPLES,), t, device=device, dtype=torch.long)
+                t_tensor = torch.full(
+                    (config.N_SAMPLES,), t, device=device, dtype=torch.long
+                )
                 predicted_noise = model(x, t_tensor)
                 beta_t = betas[t]
                 alpha_t = alphas[t]
                 alpha_cumprod_t = alphas_cumprod[t]
-                
+
                 if t > 0:
                     noise = torch.randn_like(x)
                 else:
                     noise = torch.zeros_like(x)
-                
+
                 x = (1 / torch.sqrt(alpha_t)) * (
                     x - ((beta_t / torch.sqrt(1 - alpha_cumprod_t)) * predicted_noise)
                 ) + torch.sqrt(beta_t) * noise
@@ -390,19 +426,25 @@ def main():
     device = get_device()
 
     # Compute diffusion parameters
-    betas, alphas, alphas_cumprod, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod = compute_diffusion_params(config, device)
-    
+    (
+        betas,
+        alphas,
+        alphas_cumprod,
+        sqrt_alphas_cumprod,
+        sqrt_one_minus_alphas_cumprod,
+    ) = compute_diffusion_params(config, device)
+
     # Create dataset and dataloader
     transform = get_transforms(config.IMG_SIZE)
     dataset = load_dataset(config.DATA_PATH, transform)
     dog_dataset = filter_dog_dataset(dataset)
     train_loader = create_dataloader(dog_dataset, config.BATCH_SIZE, config.NUM_WORKERS)
-    
+
     # Initialize model with self-attention in the bottleneck
     model = ImprovedUNet(
-        time_emb_dim=config.TIME_EMB_DIM, 
-        channels=config.CHANNELS, 
-        base_channels=config.BASE_CHANNELS
+        time_emb_dim=config.TIME_EMB_DIM,
+        channels=config.CHANNELS,
+        base_channels=config.BASE_CHANNELS,
     ).to(device)
 
     # Use channels_last for potential speedup
@@ -413,15 +455,20 @@ def main():
 
     # Train
     train_model(
-        model, train_loader, optimizer, config, device, 
-        sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod
+        model,
+        train_loader,
+        optimizer,
+        config,
+        device,
+        sqrt_alphas_cumprod,
+        sqrt_one_minus_alphas_cumprod,
     )
-    
+
     # Sample from the diffusion model
     samples = sample(model, config, device, betas, alphas, alphas_cumprod)
-    torchvision.utils.save_image(samples, 'improved_dog_samples.png', nrow=4)
+    torchvision.utils.save_image(samples, "improved_dog_samples.png", nrow=4)
     print("[INFO] Sampled images saved as 'improved_dog_samples.png'.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
